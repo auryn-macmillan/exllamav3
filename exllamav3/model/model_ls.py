@@ -72,30 +72,27 @@ def _slice_row_params(params: dict, a: int, b: int, rows: int) -> dict:
 
 def _microbatch_bounds(rows: int, boundaries: list | None) -> list[tuple[int, int]]:
     """
-    Split [0, rows) at job boundaries into microbatches of at most _PIPE_ROWS rows.
+    Split [0, rows) at job boundaries into at most _PIPE_ROWS rows per microbatch.
 
-    A job is never split. A job larger than the budget becomes a microbatch on its own.
+    A job is never split: a job larger than the budget becomes a microbatch on its own.
     """
     if boundaries and len(boundaries) >= 2:
         jobs = [(a, b) for a, b in zip(boundaries[:-1], boundaries[1:]) if b > a]
     else:
         jobs = [(0, rows)]
     bounds = []
-    a = None
+    cur_a = jobs[0][0]
     for s, e in jobs:
-        if a is None:
-            a = s
-        elif e - a > _PIPE_ROWS:
-            bounds.append((a, s))
-            a = s
-    if a is not None:
-        bounds.append((a, jobs[-1][1]))
+        if s != cur_a and e - cur_a > _PIPE_ROWS:
+            bounds.append((cur_a, s))
+            cur_a = s
+    bounds.append((cur_a, jobs[-1][1]))
     return bounds
 
 
 def _pipeline_rows(x: torch.Tensor, params: dict) -> int:
     """Number of microbatches to use for this pass, or 0 to run the plain serial chain"""
-    if _PIPE_ROWS < 2:
+    if _PIPE_ROWS < 1:
         return 0
     # Decode passes a 2-D (rows, hidden) tensor; prefill passes (rows, seqlen, hidden). Only decode
     # is pipelined: prefill chunks are already long enough to keep every stage busy.
