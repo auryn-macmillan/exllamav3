@@ -1520,6 +1520,9 @@ class Generator:
             "positions": positions,
             "recurrent_history": draft_tokens is not None,
             "pinned_staging": True,
+            # Row ranges of each job in this batch (see logit_mapping above). Consumers may use this
+            # to keep a job's rows together when splitting the forward into micro-batches.
+            "row_boundaries": logit_mapping,
         }
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)

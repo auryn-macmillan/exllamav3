@@ -15,8 +15,124 @@ from ..util.memory import (
 )
 from ..util.progress import ProgressBar
 from ..util.tensor import g_tensor_cache
+from ..util.device_copy import needs_bounce
+from ..cache.recurrent_util import advance_recurrent_states
 from .config import Config
 from abc import ABC, abstractmethod
+
+
+# --- row pipelining (local experiment) ------------------------------------------------------------
+#
+# The layer-split chain is a serial dependency, so with one batch only one device is ever busy (measured:
+# sum of per-card utilisation ~= 0.8 of a single card at 8 concurrent streams). EXL3_PIPE_ROWS is the
+# row budget of one microbatch: the decode batch is cut at *job* boundaries into microbatches of at most
+# that many rows, and the stages are then run as a wavefront so microbatches overlap across devices.
+# The cut must fall between jobs, never inside one: during a speculative verify round a job's rows are
+# a causal block (each draft position attends to the ones before it), so splitting them would change
+# the result. Inert (0) unless set.
+
+_PIPE_ROWS = int(os.environ.get("EXL3_PIPE_ROWS", "0") or 0)
+_PIPE_MAX_QLEN = int(os.environ.get("EXL3_PIPE_MAX_QLEN", "16") or 16)
+
+# params entries indexed by batch row
+_ROW_KEYS = (
+    "block_table",
+    "cache_seqlens",
+    "positions",
+    "position_ids",
+    "recurrent_slots",
+    "recurrent_slots_scan",
+    "recurrent_slots_scan_in",
+    "indexed_embeddings",
+    "recurrent_states",
+    # MTP draft stage in fwd_modules asserts target_hidden.shape[:-1] == x.shape
+    "target_hidden",
+)
+
+_warned = set()
+_announced = set()
+
+
+def _slice_row_params(params: dict, a: int, b: int, rows: int) -> dict:
+    """Shallow copy of params with every row-indexed entry narrowed to rows [a, b)"""
+    p = dict(params)
+    p.pop("dev_cache", None)
+    p.pop("_pipe_advanced", None)
+    p.pop("_pipe_input_ids", None)
+    p.pop("row_boundaries", None)
+    for k, v in params.items():
+        if k not in _ROW_KEYS:
+            continue
+        if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == rows:
+            p[k] = v[a:b]
+        elif isinstance(v, list) and len(v) == rows:
+            p[k] = v[a:b]
+    return p
+
+
+def _microbatch_bounds(rows: int, boundaries: list | None) -> list[tuple[int, int]]:
+    """
+    Split [0, rows) at job boundaries into microbatches of at most _PIPE_ROWS rows.
+
+    A job is never split. A job larger than the budget becomes a microbatch on its own.
+    """
+    if boundaries and len(boundaries) >= 2:
+        jobs = [(a, b) for a, b in zip(boundaries[:-1], boundaries[1:]) if b > a]
+    else:
+        jobs = [(0, rows)]
+    bounds = []
+    a = None
+    for s, e in jobs:
+        if a is None:
+            a = s
+        elif e - a > _PIPE_ROWS:
+            bounds.append((a, s))
+            a = s
+    if a is not None:
+        bounds.append((a, jobs[-1][1]))
+    return bounds
+
+
+def _pipeline_rows(x: torch.Tensor, params: dict) -> int:
+    """Number of microbatches to use for this pass, or 0 to run the plain serial chain"""
+    if _PIPE_ROWS < 2:
+        return 0
+    # Decode passes a 2-D (rows, hidden) tensor; prefill passes (rows, seqlen, hidden). Only decode
+    # is pipelined: prefill chunks are already long enough to keep every stage busy.
+    if x.dim() == 2:
+        q_len = 1
+    elif x.dim() == 3:
+        q_len = x.shape[1]
+    else:
+        return 0
+    if q_len > _PIPE_MAX_QLEN:
+        if os.environ.get("EXL3_PIPE_DEBUG"):
+            key = ("shape", x.dim(), q_len)
+            if key not in _announced:
+                _announced.add(key)
+                print(f"[pipe] skip: dim={x.dim()} q_len={q_len} (max {_PIPE_MAX_QLEN})",
+                      flush=True)
+        return 0
+    rows = x.shape[0]
+    bounds = _microbatch_bounds(rows, params.get("row_boundaries"))
+    if len(bounds) < 2:
+        if os.environ.get("EXL3_PIPE_DEBUG"):
+            key = ("rows", rows, q_len)
+            if key not in _announced:
+                _announced.add(key)
+                print(f"[pipe] skip: rows={rows} in {len(bounds)} microbatch(es) "
+                      f"(budget {_PIPE_ROWS}, q_len={q_len})", flush=True)
+        return 0
+    # Sanity: any tensor we do not know about that happens to be row-shaped is suspicious. Report it
+    # once so it can be classified rather than silently producing wrong results.
+    if _PIPE_ROWS and os.environ.get("EXL3_PIPE_DEBUG"):
+        for k, v in params.items():
+            if k in _ROW_KEYS or not isinstance(v, torch.Tensor):
+                continue
+            if v.dim() >= 1 and v.shape[0] == rows and (k, tuple(v.shape)) not in _warned:
+                _warned.add((k, tuple(v.shape)))
+                print(f"[pipe] unclassified row-shaped param {k!r} {tuple(v.shape)}", flush=True)
+    return _PIPE_ROWS
 
 
 class Model_LSMixin(ABC):
@@ -352,6 +468,8 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
+        if _pipeline_rows(x, params):
+            return self._forward_ls_pipelined(x, params)
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
@@ -359,4 +477,111 @@ class Model_LSMixin(ABC):
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
         return x
+
+
+    def _forward_ls_pipelined(
+        self,
+        x: torch.Tensor,
+        params: dict,
+    ):
+        """
+        Row-pipelined layer-split forward (see _pipeline_rows).
+
+        The layer-split chain is a serial dependency: each stage waits for the previous one, so with a
+        single batch only one device is ever busy. Splitting the batch into microbatches at job
+        boundaries and issuing the stages in wavefront order lets stage s work on microbatch m while
+        stage s+1 works on microbatch m-1, since microbatches are independent of each other. Ordering
+        across devices is explicit (one event per microbatch, re-armed at every stage boundary), so the
+        device-to-device moves can stay asynchronous.
+        """
+        rows = x.shape[0]
+        q_len = 1 if x.dim() == 2 else x.shape[1]
+        bounds = _microbatch_bounds(rows, params.get("row_boundaries"))
+        if len(bounds) < 2:
+            for module, instance, idx in self.fwd_modules:
+                params["layer_instance"] = instance
+                if x.dim() == 3 and module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                    x = x[..., -num:, :].contiguous()
+                x = module.prepare_for_device(x, params)
+                x = module.forward(x, params)
+            return x
+
+        if os.environ.get("EXL3_PIPE_DEBUG"):
+            key = (rows, q_len, len(bounds))
+            if key not in _announced:
+                _announced.add(key)
+                print(f"[pipe] active rows={rows} q_len={q_len} microbatches={len(bounds)}",
+                      flush=True)
+
+        sub = [_slice_row_params(params, a, b, rows) for a, b in bounds]
+        xs = [x[a:b] for a, b in bounds]
+        evs = [None] * len(bounds)
+
+        for module, instance, idx in self.fwd_modules:
+            dev = module.device
+            device = torch.device(dev) if not isinstance(dev, torch.device) else dev
+            logits_out = module.caps.get("logits_output")
+            for mi in range(len(bounds)):
+                p = sub[mi]
+                p["layer_instance"] = instance
+                xi = xs[mi]
+                if xi.dim() == 3 and logits_out and (num := p.get("last_tokens_only")):
+                    xi = xi[..., -num:, :].contiguous()
+                if device.type != "cuda":
+                    xs[mi] = module.forward(module.prepare_for_device(xi, p), p)
+                    continue
+                dst = torch.cuda.current_stream(device)
+                if evs[mi] is not None:
+                    dst.wait_event(evs[mi])
+                if xi.device != device and xi.device.type == "cuda" and \
+                        not needs_bounce(xi.device, device):
+                    # Direct peer move, kept asynchronous: issued on the source stream (so it is
+                    # ordered after the producing stage) and fenced into the destination stream,
+                    # instead of draining the host as a blocking copy would
+                    src = torch.cuda.current_stream(xi.device)
+                    if evs[mi] is not None:
+                        src.wait_event(evs[mi])
+                    xi = xi.to(device, non_blocking = True)
+                    ev_copy = torch.cuda.Event()
+                    ev_copy.record(src)
+                    dst.wait_event(ev_copy)
+                xi = module.prepare_for_device(xi, p)
+                xi = module.forward(xi, p)
+                ev = torch.cuda.Event()
+                ev.record(dst)
+                xs[mi] = xi
+                evs[mi] = ev
+
+        # Join: everything downstream (sampling, cache bookkeeping) runs on the output device's stream
+        for mi in range(len(bounds)):
+            xi = xs[mi]
+            if xi.device.type == "cuda" and evs[mi] is not None:
+                torch.cuda.current_stream(xi.device).wait_event(evs[mi])
+        out = xs[0] if len(xs) == 1 else torch.cat(xs, dim=0)
+
+        # Drafting reads the exported hidden states, and slices them by the row range of each job,
+        # so they must be merged back into the original row order. Each microbatch accumulated its
+        # own list (the params copies are independent), so concatenate entry by entry: entry i is
+        # produced by the same layer in every microbatch, on the same device.
+        merged = None
+        for p in sub:
+            s = p.get("export_states")
+            if not s:
+                continue
+            if merged is None:
+                merged = list(s)
+            else:
+                for i, t in enumerate(s):
+                    merged[i] = torch.cat((merged[i], t), dim = 0)
+        if merged is not None:
+            params["export_states"] = merged
+
+        # Recurrent state bookkeeping is per microbatch: the staged scan inputs are indexed by row
+        # within the pass that wrote them
+        if params.get("recurrent_states"):
+            for (a, b), p in zip(bounds, sub):
+                advance_recurrent_states(
+                    torch.empty((b - a, q_len), dtype=torch.long), p, self)
+            params["_pipe_advanced"] = True
+        return out
 

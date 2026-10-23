@@ -437,6 +437,9 @@ class Model(Model_TPMixin, Model_LSMixin):
             for m in self._get_prefetch_layers:
                 m.prefetch(x, params)
             y = self.forward_ls(x, params)
+            if params.pop("_pipe_advanced", False):
+                # The row-pipelined path advanced the recurrent states per microbatch
+                return y
             advance_recurrent_states(input_ids, params, self)
             return y
 
