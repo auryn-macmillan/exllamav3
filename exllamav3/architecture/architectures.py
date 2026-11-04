@@ -61,6 +61,7 @@ from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
 from .qwen3_vl import Qwen3VLModel
 from .qwen3_vl_moe import Qwen3VLMoeModel
+from .ricursive import RicursiveModel
 from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 from .solar_open_moe import SolarOpenMoeModel
@@ -143,6 +144,7 @@ ARCHITECTURES = {
         Qwen3VLModel,
         Qwen3VLMoeModel,
         Qwen4ExpModel,
+        RicursiveModel,
         SeedOssModel,
         SmolLM3Model,
         SolarOpenMoeModel,

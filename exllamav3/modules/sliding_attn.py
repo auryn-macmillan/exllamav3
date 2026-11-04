@@ -274,6 +274,7 @@ class SlidingAttention(Module):
         key_fused_qkv: str | None = None,
         key_o: str | None = None,
         key_g: str | None = None,
+        valres_key: str | None = None,
         key_sinks: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
@@ -355,6 +356,10 @@ class SlidingAttention(Module):
         self.g_proj = None
         self.key_sinks = key_sinks
         self.sinks = None
+        # Value residual (Ricursive): see Attention
+        self.valres_key = valres_key
+        self.valres_lambda_t = None
+        self.valres_blend = None
 
         if self.num_kv_heads == 0:
             return
@@ -537,8 +542,17 @@ class SlidingAttention(Module):
                 f"{self.key}.{self.key_sinks}", device, no_defer = True
             ).float().contiguous()
 
+        if self.valres_key:
+            t = self.config.stc.get_tensor(
+                f"{self.key}.{self.valres_key}", device, allow_bf16 = True, no_defer = True
+            )
+            assert t.numel() == 1, f"SlidingAttention: {self.key}.{self.valres_key} must be a scalar"
+            self.valres_lambda_t = t.float().contiguous()
+            self.valres_blend = torch.sigmoid(self.valres_lambda_t).item()
+
         # Test if K and V proj can be fused
         if (
+            not self.valres_key and
             not self.config.infer_params.no_reconstruct and
             device != torch.device("cpu") and
             self.k_proj.quant_type == "exl3" and
@@ -588,6 +602,7 @@ class SlidingAttention(Module):
         )
         if (
             _qkv_slice_enable and
+            not self.valres_key and
             not self.config.infer_params.no_reconstruct and
             device != torch.device("cpu") and
             gate_ok and
@@ -647,6 +662,8 @@ class SlidingAttention(Module):
         self.bc_attn = {}
         self.rope = None
         self.sinks = None
+        self.valres_lambda_t = None
+        self.valres_blend = None
 
         if self.multi_kv is not None:
             self.multi_kv.unload()
@@ -677,6 +694,8 @@ class SlidingAttention(Module):
         if self.sinks is not None:
             # bf16 -> fp16 is exact at sink-logit magnitudes; stored as loaded
             t[f"{self.key}.{self.key_sinks}"] = self.sinks.half().contiguous()
+        if self.valres_key is not None:
+            t[f"{self.key}.{self.valres_key}"] = self.valres_lambda_t.data.contiguous()
         return t
 
 
@@ -707,6 +726,23 @@ class SlidingAttention(Module):
 
         return to2(x, out_dtype, self.out_dtype)
 
+
+    def _valres_input(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        seed = params.get("valres_seed")
+        if seed is None:
+            raise RuntimeError(
+                "SlidingAttention: value residual is enabled but params has no valres_seed; "
+                "the model's embedding module must supply the scaled layer-0 embedding"
+            )
+        key = (x.device.type, x.device.index)
+        cache = params.get("valres_seed_dev")
+        if cache is None:
+            cache = params["valres_seed_dev"] = {}
+        s = cache.get(key)
+        if s is None or s.dtype != x.dtype:
+            s = seed.to(device = x.device, dtype = x.dtype)
+            cache[key] = s
+        return torch.lerp(s, x, self.valres_blend)
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
@@ -755,7 +791,10 @@ class SlidingAttention(Module):
 
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
-            v = self.v_proj.forward(x, params)
+            if self.valres_key:
+                v = self.v_proj.forward(self._valres_input(x, params), params)
+            else:
+                v = self.v_proj.forward(x, params)
 
         else:
             if x.shape[-1] < self.k_proj.in_features:

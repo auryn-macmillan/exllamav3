@@ -173,6 +173,20 @@ class Embedding(Module):
     def weights_numel(self):
         return self._numel
         
+    def _stash_valres_seed(self, x: torch.Tensor, params: dict):
+        """
+        Ricursive-style value residuals need the scaled layer-0 embedding for every layer.
+        Clone it: the residual stream is updated in place by the first block, so a reference
+        would be corrupted before the later layers read it. Keep it in fp16; the value
+        projection input is fp16 anyway.
+        """
+        if self.config is None or not getattr(self.config, "use_valres", False):
+            return
+        seed = x.half() if x.dtype != torch.half else x
+        params["valres_seed"] = seed.clone()
+        # Invalidate the per-device copies cached by the attention modules
+        params.pop("valres_seed_dev", None)
+
     @override
     def forward(
         self,
@@ -251,6 +265,7 @@ class Embedding(Module):
             if deepstack_emb is not None:
                 params["deepstack_emb"] = deepstack_emb
 
+            self._stash_valres_seed(combined_emb, params)
             return combined_emb
 
         # No indexed embeddings, or none in current batch
@@ -280,6 +295,7 @@ class Embedding(Module):
                     self._pinned_staging[key] = buf
                 buf.copy_(x)
                 x = buf
+            self._stash_valres_seed(x, params)
             return x
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
