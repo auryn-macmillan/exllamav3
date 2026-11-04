@@ -1633,6 +1633,11 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     def cols(x, a, b):
         return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
     k, n = weight_q.shape
+    # Large down projections: the k x k LU solve needs a copy of A on top of H, and the
+    # original fp32 weight is the easiest thing to evict. cols() already streams columns
+    # from the CPU, so this only trades a little PCIe traffic for the headroom to solve.
+    if weight.device == dev and k >= 16384:
+        weight = weight.cpu()
     Q = weight_q
     su = su.float().to(dev).view(k, 1).clone()
     sv = sv.float().to(dev).view(1, n).clone()
