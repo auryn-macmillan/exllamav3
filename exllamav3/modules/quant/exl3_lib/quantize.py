@@ -1625,12 +1625,10 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     """
     dev = weight_q.device
     H = H.to(dev)
-    if damping > 0.0:
-        d_off = damping * H.diagonal().mean().item()
-        H_err = H.clone()
-        H_err.diagonal().sub_(d_off)
-    else:
-        H_err = H
+    # H_err = H - d_off*I for the reported error. Apply the diagonal shift on the fly instead
+    # of cloning H: at 40960-wide down projections the clone alone is 6.7 GB, and refit is the
+    # peak-memory step of a 4 bpw conversion
+    d_off = damping * H.diagonal().mean().item() if damping > 0.0 else 0.0
     W = weight if weight.device == dev else None      # large originals may sit on the CPU; stream columns
     def cols(x, a, b):
         return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
@@ -1646,18 +1644,18 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         HW_chunk = H @ wc
         den += (wc * HW_chunk).sum().item()
     den_err = den
-    if H_err is not H:
+    if d_off != 0.0:
         den_err = 0.0
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
             wc = cols(weight, a, b)
-            den_err += (wc * (H_err @ wc)).sum().item()
+            den_err += (wc * (H @ wc)).sum().item() - d_off * (wc * wc).sum().item()
     def err(Qx):
         e = 0.0
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
             E = cols(weight, a, b) - Qx[:, a:b]
-            e += (E * (H_err @ E)).sum().item()
+            e += (E * (H @ E)).sum().item() - d_off * (E * E).sum().item()
         return e / max(den_err, 1e-30)
     e_before = err(Q)
     for _ in range(rounds):
@@ -1678,8 +1676,12 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         Q *= c.view(1, n)
         sv *= c.view(1, n)
         
-        # input-side scales
-        A = (Q @ Q.T) * H # Keep this out-of-place to prevent fp16/fp32 dtype casting bugs
+        # input-side scales. Promote Q@Q.T to H's dtype before the elementwise product, then
+        # multiply in place: the old expression held both operands and the result at once
+        A = Q @ Q.T
+        if A.dtype != H.dtype:
+            A = A.to(H.dtype)
+        A.mul_(H)
         A.diagonal().add_(1e-6 * A.diagonal().mean())
 
         b_ = torch.zeros(k, device=dev)
