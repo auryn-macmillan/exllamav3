@@ -473,6 +473,10 @@ def prepare_state(args, job_state, config, model, tokenizer):
             print(f" -- Resuming after: {model.modules[idx - 1].key}")
         state = load_tensor("ckpt/state.safetensors", args)
         original_input_ids = load_tensor("ckpt/original_input_ids.safetensors", args)
+        # Value-residual models need the layer-0 rows after the embedding has been passed
+        seeds_path = os.path.join(args["work_dir"], "ckpt/valres_seeds.safetensors")
+        if getattr(config, "use_valres", False) and os.path.exists(seeds_path):
+            model._calib_valres_seeds = load_tensor("ckpt/valres_seeds.safetensors", args)
     return state, original_input_ids
 
 
@@ -1858,6 +1862,9 @@ def main(args, job_state):
             save_dict("ckpt_new/job.json", job_state, args)
             save_tensor(state, "ckpt_new/state.safetensors", args)
             save_tensor(original_input_ids, "ckpt_new/original_input_ids.safetensors", args)
+            seeds = getattr(model, "_calib_valres_seeds", None)
+            if getattr(config, "use_valres", False) and seeds is not None:
+                save_tensor(seeds, "ckpt_new/valres_seeds.safetensors", args)
             save_preserves(quant_preserves, idx, "ckpt_new/preserve.pt", args)
             if os.path.exists(ckpt_dir_old):
                 shutil.rmtree(ckpt_dir_old)
