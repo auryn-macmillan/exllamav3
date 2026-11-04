@@ -476,7 +476,9 @@ def prepare_state(args, job_state, config, model, tokenizer):
         # Value-residual models need the layer-0 rows after the embedding has been passed
         seeds_path = os.path.join(args["work_dir"], "ckpt/valres_seeds.safetensors")
         if getattr(config, "use_valres", False) and os.path.exists(seeds_path):
-            model._calib_valres_seeds = load_tensor("ckpt/valres_seeds.safetensors", args)
+            model._calib_valres_seeds = [
+                s.half() for s in load_tensor("ckpt/valres_seeds.safetensors", args)
+            ]
     return state, original_input_ids
 
 
@@ -1834,7 +1836,8 @@ def main(args, job_state):
 
         # Module 0 is the embedding: keep the scaled layer-0 rows for value-residual models
         if idx == 0 and getattr(config, "use_valres", False):
-            model._calib_valres_seeds = list(state)
+            # The embedding output is fp32; the V projection runs in fp16
+            model._calib_valres_seeds = [s.half() for s in state]
 
         # Feedback after module. Trim first so the reported RSS reflects what the job actually
         # retains, not what the allocator happens to be holding
