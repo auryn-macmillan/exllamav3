@@ -684,6 +684,9 @@ def _module_eligible(m):
     """Module-level requirements shared by the global-attention and SWA builders."""
     return (
         bc_attn_enable and
+        # Value residuals (Ricursive) feed V from a different, per-forward tensor than Q/K/G.
+        # The graph stages one input and bakes the V projection into it, so stay on the eager path
+        not getattr(m, "valres_key", None) and
         _qsa_module_eligible(m) and
         # NoPE is supported (the rope stage is skipped), but the head norms run inside the rope
         # kernel, so a norm-only module without rope has nowhere to apply them
