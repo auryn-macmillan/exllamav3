@@ -155,3 +155,82 @@ def make_dsv4_checkpoint(out_dir, seed: int = 7, **overrides) -> str:
     with open(os.path.join(out_dir, "config.json"), "w") as fp:
         json.dump(dsv4_config_json(c), fp, indent = 2)
     return out_dir
+
+
+RICURSIVE_TINY = dict(
+    hidden_size = 128,
+    intermediate_size = 256,
+    num_hidden_layers = 3,
+    num_attention_heads = 8,
+    num_key_value_heads = 2,
+    head_dim = 16,
+    vocab_size = 512,
+    sliding_window = 8,
+    layer_types = ["sliding_attention", "sliding_attention", "full_attention"],
+    use_valres = True,
+    use_gated_attention = True,
+    ffn_clamp_threshold = 20.0,
+)
+
+
+def make_ricursive_checkpoint(out_dir, seed: int = 11, **overrides) -> str:
+    """Random-weight Ricursive (Ripple) checkpoint in the release's HF tensor names"""
+    torch.manual_seed(seed)
+    c = dict(RICURSIVE_TINY, **overrides)
+    H = c["hidden_size"]
+    hd = c["head_dim"]
+    nh = c["num_attention_heads"]
+    nkv = c["num_key_value_heads"]
+    t = {}
+
+    def w(name, *shape, scale = 0.02, dtype = torch.bfloat16):
+        t[name] = (torch.randn(*shape, dtype = torch.float) * scale).to(dtype)
+
+    def normw(name, dim):
+        t[name] = (1.0 + 0.1 * torch.randn(dim)).to(torch.bfloat16)
+
+    w("model.embed_tokens.weight", c["vocab_size"], H)
+    w("lm_head.weight", c["vocab_size"], H)
+    normw("model.norm.weight", H)
+
+    for i in range(c["num_hidden_layers"]):
+        L = f"model.layers.{i}"
+        normw(f"{L}.input_layernorm.weight", H)
+        normw(f"{L}.post_attention_layernorm.weight", H)
+        normw(f"{L}.pre_feedforward_layernorm.weight", H)
+        normw(f"{L}.post_feedforward_layernorm.weight", H)
+        w(f"{L}.self_attn.q_proj.weight", nh * hd, H)
+        w(f"{L}.self_attn.k_proj.weight", nkv * hd, H)
+        w(f"{L}.self_attn.v_proj.weight", nkv * hd, H)
+        w(f"{L}.self_attn.o_proj.weight", H, nh * hd)
+        normw(f"{L}.self_attn.q_norm.weight", hd)
+        normw(f"{L}.self_attn.k_norm.weight", hd)
+        if c["use_gated_attention"]:
+            w(f"{L}.self_attn.g_proj.weight", nh * hd, H)
+        if c["use_valres"]:
+            t[f"{L}.self_attn.value_res_lambda"] = torch.tensor(
+                [float([-2.0, 0.5, 2.0][i % 3])], dtype = torch.float)
+        w(f"{L}.mlp.gate_proj.weight", c["intermediate_size"], H)
+        w(f"{L}.mlp.up_proj.weight", c["intermediate_size"], H)
+        w(f"{L}.mlp.down_proj.weight", H, c["intermediate_size"])
+
+    cfg = dict(c)
+    cfg.update({
+        "architectures": ["RicursiveForCausalLM"],
+        "model_type": "ricursive",
+        "hidden_act": "silu",
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "max_position_embeddings": 512,
+        "embed_scale": H ** 0.5,
+        "tie_word_embeddings": False,
+        "bos_token_id": 1,
+        "eos_token_id": [2, 3],
+        "pad_token_id": 0,
+        "use_cache": True,
+    })
+    os.makedirs(out_dir, exist_ok = True)
+    save_file(t, os.path.join(out_dir, "model.safetensors"))
+    with open(os.path.join(out_dir, "config.json"), "w") as fp:
+        json.dump(cfg, fp, indent = 2)
+    return out_dir
