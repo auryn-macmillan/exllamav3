@@ -1625,11 +1625,6 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     """
     dev = weight_q.device
     H = H.to(dev)
-    # At 40960-wide down projections H alone is 6.7 GB and the LU solve needs another
-    # 6.25 GB. Keep H in bf16 for this polish step when it is that large; the fitted
-    # scales are stored as fp16, so the extra mantissa bits are not what limits them.
-    if H.shape[0] >= 16384 and H.dtype == torch.float32:
-        H = H.to(torch.bfloat16)
     # H_err = H - d_off*I for the reported error. Apply the diagonal shift on the fly instead
     # of cloning H: at 40960-wide down projections the clone alone is 6.7 GB, and refit is the
     # peak-memory step of a 4 bpw conversion
@@ -1893,8 +1888,17 @@ def quantize_exl3(
         weight_q = preapply_had_r_(weight_q, had_n)
         weight_q *= sv
 
-        # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
-        if not q_fallback and H is not None and not quant_args.get("no_refit"):
+        # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference).
+        # A 40960-wide down projection's H is 6.7 GB and the k x k solve needs another 6.25 GB
+        # plus a Qf copy; skip the polish when the card cannot hold both, rather than OOM.
+        do_refit = not q_fallback and H is not None and not quant_args.get("no_refit")
+        if do_refit and device.type == "cuda":
+            k_, n_ = weight_q.shape
+            need = 2 * k_ * k_ * 4 + k_ * n_ * 4 + (2 << 30)
+            free = torch.cuda.mem_get_info(device)[0]
+            if need > free:
+                do_refit = False
+        if do_refit:
             # On the quantization device whichever device H is parked on, so the result doesn't depend on swapping
             H_orig = unrotate_H(H.to(device), H_data["su"])
             weight_q, su_f, sv_f, e_before, e_after = refit_scales(weight_orig, weight_q, H_orig, su, sv,
