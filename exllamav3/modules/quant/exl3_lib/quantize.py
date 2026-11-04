@@ -1625,6 +1625,11 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     """
     dev = weight_q.device
     H = H.to(dev)
+    # At 40960-wide down projections H alone is 6.7 GB and the LU solve needs another
+    # 6.25 GB. Keep H in bf16 for this polish step when it is that large; the fitted
+    # scales are stored as fp16, so the extra mantissa bits are not what limits them.
+    if H.shape[0] >= 16384 and H.dtype == torch.float32:
+        H = H.to(torch.bfloat16)
     # H_err = H - d_off*I for the reported error. Apply the diagonal shift on the fly instead
     # of cloning H: at 40960-wide down projections the clone alone is 6.7 GB, and refit is the
     # peak-memory step of a 4 bpw conversion
@@ -1632,6 +1637,10 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     W = weight if weight.device == dev else None      # large originals may sit on the CPU; stream columns
     def cols(x, a, b):
         return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
+    def hmat(x):
+        if H.dtype == torch.float32:
+            return H @ x
+        return (H @ x.to(H.dtype)).float()
     k, n = weight_q.shape
     # Large down projections: the k x k LU solve needs a copy of A on top of H, and the
     # original fp32 weight is the easiest thing to evict. cols() already streams columns
@@ -1646,7 +1655,7 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
     for a in range(0, n, chunk):
         b = min(a + chunk, n)
         wc = cols(weight, a, b)
-        HW_chunk = H @ wc
+        HW_chunk = hmat(wc)
         den += (wc * HW_chunk).sum().item()
     den_err = den
     if d_off != 0.0:
@@ -1654,13 +1663,13 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
             wc = cols(weight, a, b)
-            den_err += (wc * (H @ wc)).sum().item() - d_off * (wc * wc).sum().item()
+            den_err += (wc * hmat(wc)).sum().item() - d_off * (wc * wc).sum().item()
     def err(Qx):
         e = 0.0
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
             E = cols(weight, a, b) - Qx[:, a:b]
-            e += (E * (H @ E)).sum().item() - d_off * (E * E).sum().item()
+            e += (E * hmat(E)).sum().item() - d_off * (E * E).sum().item()
         return e / max(den_err, 1e-30)
     e_before = err(Q)
     for _ in range(rounds):
@@ -1671,9 +1680,9 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
             wc = cols(weight, a, b)
-            HW_chunk = H @ wc # Recompute on the fly
+            HW_chunk = hmat(wc) # Recompute on the fly
             
-            HQ = H @ Q[:, a:b]
+            HQ = hmat(Q[:, a:b])
             num[a:b] = (Q[:, a:b] * HW_chunk).sum(0)
             dn[a:b] = (Q[:, a:b] * HQ).sum(0)
             
@@ -1683,9 +1692,9 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         
         # input-side scales. Promote Q@Q.T to H's dtype before the elementwise product, then
         # multiply in place: the old expression held both operands and the result at once
-        A = Q @ Q.T
-        if A.dtype != H.dtype:
-            A = A.to(H.dtype)
+        Qf = Q.float()
+        A = Qf @ Qf.T
+        del Qf
         A.mul_(H)
         A.diagonal().add_(1e-6 * A.diagonal().mean())
 
@@ -1693,7 +1702,7 @@ def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, 
         for a in range(0, n, chunk):
             b = min(a + chunk, n)
             wc = cols(weight, a, b)
-            HW_chunk = H @ wc
+            HW_chunk = hmat(wc)
             b_ += (Q[:, a:b] * HW_chunk).sum(1)
         
         r = torch.linalg.solve(A, b_)
