@@ -977,6 +977,17 @@ def run_row_workers(title, num_rows, workers, progress_count):
         raise errors[0]
 
 
+def add_valres_seed(model, i, params):
+    """
+    Calibration runs one module at a time and only carries hidden states between them, so a
+    model with value residuals (Ricursive) also needs the layer-0 embedding for the row. The
+    main loop stashes those after the embedding module; inject the matching one here.
+    """
+    seeds = getattr(model, "_calib_valres_seeds", None)
+    if seeds is not None:
+        params["valres_seed"] = seeds[i]
+
+
 def capture_passes(module, devices, headroom_min = 1536 << 20, headroom_frac = 0.06):
     """
     Split a module's Hessian capture into passes whose block-packed fp32 Hessians fit beside the loaded weights on
@@ -1054,6 +1065,7 @@ def capture_module_serial(
                 params["moe_affinity"] = aff_store
             if slicing:
                  params["q_mlp_slice"] = current_slice
+            add_valres_seed(model, i, params)
             get_preserve(i, params)
             rs = module.prepare_for_device(state[i], params)
             rs = module.forward(rs, params)
@@ -1067,6 +1079,7 @@ def capture_module_serial(
                     }
                     if slicing:
                         params["q_mlp_slice"] = current_slice
+                    add_valres_seed(model, i, params)
                     get_preserve(i, params)
                     rs = module.prepare_for_device(state[i], params)
                     rs = module.forward(rs, params)
@@ -1137,6 +1150,7 @@ def capture_module_parallel(
                     params["moe_affinity"] = aff_stores[t_idx]
                 if slicing:
                     params["q_mlp_slice"] = current_slice
+                add_valres_seed(model, i, params)
                 get_preserve(i, params)
                 rs = module.prepare_for_device(state[i], params)
                 rs = module.forward(rs, params)
@@ -1150,6 +1164,7 @@ def capture_module_parallel(
                         }
                         if slicing:
                             params["q_mlp_slice"] = current_slice
+                        add_valres_seed(model, i, params)
                         get_preserve(i, params)
                         rs = module.prepare_for_device(state[i], params)
                         rs = module.forward(rs, params)
@@ -1246,6 +1261,7 @@ def advance_state_parallel(
                     "attn_mode": "flash_attn_nc",
                     "input_ids": original_input_ids[i],
                 }
+                add_valres_seed(model, i, params)
                 state[i] = module.prepare_for_device(state[i], params)
                 row_bad = False
                 if i < num_ref_states or not is_last_module:
@@ -1787,6 +1803,7 @@ def main(args, job_state):
                             "attn_mode": "flash_attn_nc",
                             "input_ids": original_input_ids[i],
                         }
+                        add_valres_seed(model, i, params)
                         state[i] = module.prepare_for_device(state[i], params)
                         if i < num_ref_states or idx < len(model.modules) - 1:
                             get_preserve(i, params)
@@ -1810,6 +1827,10 @@ def main(args, job_state):
                 cos_error /= n
                 sqnr_ /= n
                 check_bad_rows(bad_rows, len(state))
+
+        # Module 0 is the embedding: keep the scaled layer-0 rows for value-residual models
+        if idx == 0 and getattr(config, "use_valres", False):
+            model._calib_valres_seeds = list(state)
 
         # Feedback after module. Trim first so the reported RSS reflects what the job actually
         # retains, not what the allocator happens to be holding
