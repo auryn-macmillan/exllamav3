@@ -52,12 +52,17 @@ def plan_cache(devices, **state):
     )
 
 
+def shape(stages):
+    return [(s.device, s.steps) for s in stages]
+
+
 def test_pinned_attention_does_not_disqualify_the_split():
     m = plan_model(["cuda:0", "cuda:1", "cuda:1"])
     m.fwd_modules[1] = (module("cuda:1", pinned("cuda:0")), 0, 1)
-    stages, draft = PrefillPipeline.plan(m, None)
-    assert stages == [(D0, 0, 1), (D1, 1, 3)]
-    assert draft is None
+    stages, draft, advance = PrefillPipeline.plan(m, None)
+    # Not a TransformerBlock, so the pinned part stays inline and the route is plain sections
+    assert shape(stages) == [(D0, [("section", 0, 1)]), (D1, [("section", 1, 3)])]
+    assert draft is None and advance == 0
 
 
 def test_a_part_on_another_device_that_is_not_pinned_still_rejects():
@@ -87,7 +92,7 @@ def test_ring_states_on_a_pinned_device_the_first_stage_does_not_run_reject():
 def test_pipeline_locks_each_pinned_device():
     m = plan_model(["cuda:0", "cuda:1"])
     m.fwd_modules[1] = (module("cuda:1", pinned("cuda:2")), 0, 1)
-    stages, draft = PrefillPipeline.plan(m, None)
+    stages, draft, _ = PrefillPipeline.plan(m, None)
     pipe = PrefillPipeline(m, stages, draft)
     try:
         assert set(pipe.device_locks) == {D2}

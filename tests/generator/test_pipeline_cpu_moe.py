@@ -14,11 +14,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from exllamav3.model.prefill_pipeline import PrefillPipeline
+from exllamav3.model.prefill_pipeline import PrefillPipeline, Stage
 
 pytestmark = pytest.mark.nogpu
 
 D0, D1 = torch.device("cuda:0"), torch.device("cuda:1")
+
+
+def shape(stages):
+    return [(s.device, s.steps) for s in stages]
 
 
 class _Child:
@@ -46,15 +50,15 @@ class _Model:
 
 def test_cpu_moe_host_does_not_disqualify_the_split():
     model = _Model([D0, D1, D1])
-    stages, draft = PrefillPipeline.plan(model, None)
-    assert stages == [(D0, 0, 1), (D1, 1, 3)]
+    stages, draft, _ = PrefillPipeline.plan(model, None)
+    assert shape(stages) == [(D0, [("section", 0, 1)]), (D1, [("section", 1, 3)])]
     assert draft is None
 
 
 def test_cpu_side_parts_stay_on_the_stage():
     model = _Model([D0, D1, D1], children = {1: (_Child(torch.device("cpu")),)})
-    stages, _ = PrefillPipeline.plan(model, None)
-    assert stages == [(D0, 0, 1), (D1, 1, 3)]
+    stages, _, _ = PrefillPipeline.plan(model, None)
+    assert shape(stages) == [(D0, [("section", 0, 1)]), (D1, [("section", 1, 3)])]
 
 
 def test_cuda_part_on_another_device_still_rejects():
@@ -87,7 +91,7 @@ class _StubModel:
 
 def test_every_pipelined_chunk_wakes_the_cpu_workers():
     model = _StubModel()
-    pipe = PrefillPipeline(model, [(D0, 0, 1), (D1, 1, 3)], None)
+    pipe = PrefillPipeline(model, [Stage(D0, [("section", 0, 1)]), Stage(D1, [("section", 1, 3)])], None)
     for n in range(3):
         pipe.prefill(torch.zeros(1, 4), {"chunk": n, "block_table": torch.zeros(1)}, "job")
     pipe.flush()

@@ -156,21 +156,14 @@ class TransformerBlock(Module):
             y = self.attn.forward(self.attn.prepare_for_device(y, params), params)
             return to_device(y, self.device)
 
-    @override
-    def forward(
-        self,
-        x: torch.Tensor,
-        params: dict,
-        out_dtype: torch.dtype | None = None
-    ) -> torch.Tensor:
 
-        export_state = params.get("export_state_layers")
-        export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
-
-        y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
-
-        # Previous block's MLP output whose residual add is folded into this block's input norm (forward_ls sets
-        # resid_defer when the next module is a TransformerBlock on the same device)
+    def pre_attn(self, x: torch.Tensor, params: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        The block up to the attention input: the previous block's deferred residual, the input norm, and for a
+        hyperconnected block the mix (mix_norm). Returns the residual x and the attention input y, both on this
+        block's device. The attention runs wherever it is loaded (attn.forward, or its own stage in the prefill
+        pipeline) and post_attn() finishes the block from x and its output.
+        """
         pending = params.pop("resid_pending", None)
         fuse_in = (
             pending is not None and self.attn is not None and not self.attn_hc and
@@ -178,31 +171,52 @@ class TransformerBlock(Module):
         )
         if pending is not None and not fuse_in:
             x += pending
+        if self.attn is None:
+            return x, None
+        if self.attn_hc:
+            hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
+            if self.attn_norm and not normed:
+                # Normalize from the collapse's own precision (fp32 on the carry path, see
+                # HyperConnection.mix_norm) rather than a half copy of it
+                y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+            else:
+                y = y.half()
+            # What apply_ needs of the mix, for the block's device (the residual streams stay there)
+            params["attn_hc_carry"] = (hc_post, hc_comb)
+        elif fuse_in:
+            y = self.attn_norm.forward(pending, params, out_dtype = torch.half, residual_in = x)
+        elif self.attn_norm:
+            y = self.attn_norm.forward(x, params, out_dtype = torch.half)
+        else:
+            y = x.half()
+        return x, y
 
-        if self.attn:
-            if self.attn_hc:
-                hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
-                if self.attn_norm and not normed:
-                    # Normalize from the collapse's own precision (fp32 on the carry path, see
-                    # HyperConnection.mix_norm) rather than a half copy of it
-                    y = self.attn_norm.forward(y, params, out_dtype = torch.half)
-                else:
-                    y = y.half()
-            elif fuse_in:
-                y = self.attn_norm.forward(pending, params, out_dtype = torch.half, residual_in = x)
-            elif self.attn_norm:
-                y = self.attn_norm.forward(x, params, out_dtype = torch.half)
-            else:
-                y = x.half()
-            if self.attn.device != self.device:
-                y = self._pinned_attention(y, params)
-            else:
-                y = self.attn.forward(y, params)
+
+    def post_attn(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor | None,
+        params: dict,
+        out_dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        """
+        The block from the attention output: residual add (or the mHC apply_, or a post-norm's residual), the
+        MLP, state export, output cast. y is on this block's device (to_device from wherever the attention ran).
+        """
+        export_state = params.get("export_state_layers")
+        export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
+
+        y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
+        if self.attn is not None and y is not None:
+            # What pre_attn's mix left for apply_ (on this block's device); dropped on every path, including
+            # the prefill one that stops after the attention
+            carry = params.pop("attn_hc_carry", None)
             if params.get("prefill") and not export_state:
                 return x
             if self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
             if self.attn_hc:
+                hc_post, hc_comb = carry
                 x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
@@ -262,6 +276,23 @@ class TransformerBlock(Module):
             x *= self.layer_scalar_f
 
         return to2(x, out_dtype, self.out_dtype)
+
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+
+        x, y = self.pre_attn(x, params)
+        if self.attn is not None:
+            if self.attn.device != self.device:
+                y = self._pinned_attention(y, params)
+            else:
+                y = self.attn.forward(y, params)
+        return self.post_attn(x, y, params, out_dtype)
 
 
     def get_name(self):

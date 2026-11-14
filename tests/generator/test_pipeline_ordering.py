@@ -12,11 +12,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from exllamav3.model.prefill_pipeline import PrefillPipeline
+from exllamav3.model.prefill_pipeline import PrefillPipeline, Stage
 
 pytestmark = pytest.mark.nogpu
 
 D0, D1, D2 = torch.device("cuda:0"), torch.device("cuda:1"), torch.device("cuda:2")
+
+
+def sections(*ranged):
+    """Stages of plain sections, as the plan builds them for a split with no pinned parts"""
+    return [Stage(device, [("section", a, b)]) for device, a, b in ranged]
+
+
+def shape(stages):
+    return [(s.device, s.steps) for s in stages]
 
 
 class StubState:
@@ -67,7 +76,7 @@ class StubModel:
         return x
 
 
-STAGES = [(D0, 0, 2), (D1, 2, 4)]
+STAGES = sections((D0, 0, 2), (D1, 2, 4))
 
 
 def chunk_params(n, states = None):
@@ -75,7 +84,7 @@ def chunk_params(n, states = None):
 
 
 def make(model, draft = False):
-    stages = STAGES + ([(D0, 0, 0)] if draft else [])
+    stages = STAGES + ([Stage(D0, [])] if draft else [])
     return PrefillPipeline(model, stages, 2 if draft else None)
 
 
@@ -256,14 +265,15 @@ def plan_cache(devices, state_cls = SimpleNamespace()):
 
 
 def test_plan_cuts_the_forward_at_device_changes():
-    stages, draft = PrefillPipeline.plan(plan_model(["cpu", "cuda:0", "cuda:0", "cuda:1", "cuda:1"]), None)
-    assert stages == [(D0, 0, 3), (D1, 3, 5)] and draft is None
+    stages, draft, advance = PrefillPipeline.plan(plan_model(["cpu", "cuda:0", "cuda:0", "cuda:1", "cuda:1"]), None)
+    assert shape(stages) == [(D0, [("section", 0, 3)]), (D1, [("section", 3, 5)])]
+    assert draft is None and advance == 0
 
 
 def test_plan_appends_the_draft_device():
     draft = plan_model(["cpu", "cuda:1", "cuda:1"], caps = {})
-    stages, stage = PrefillPipeline.plan(plan_model(["cuda:0", "cuda:1"]), None, draft)
-    assert stage == 2 and stages[2] == (D1, 0, 0)
+    stages, stage, _ = PrefillPipeline.plan(plan_model(["cuda:0", "cuda:1"]), None, draft)
+    assert stage == 2 and stages[2].device == D1
 
 
 @pytest.mark.parametrize("devices", [["cuda:0", "cuda:0"], ["cuda:0", "cuda:1", "cuda:0"]])
