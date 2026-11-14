@@ -60,15 +60,22 @@ class PrefillPipeline:
         target's stages), or None if the split can't run this way.
         """
         modules = getattr(model, "fwd_modules", None)
-        if not modules or model.loaded_tp or getattr(model.config, "moe_cpu_hosts", None):
+        if not modules or model.loaded_tp:
             return None
         stages = []
         for i, (module, _, _) in enumerate(modules):
             device = torch.device(module.device)
             if device.type != "cuda":
                 continue
-            # Parts of a layer on another device would run on the wrong device's thread
-            if any(m.device is not None and torch.device(m.device) != device for m in module):
+            # Parts of a layer on another CUDA device would run on the wrong device's thread.
+            # Host-side parts (pinned linears, CPU-expert hosts) stay on this stage's thread:
+            # MoeCpuHost serializes its job ring and staging ring across the stage threads
+            if any(
+                m.device is not None
+                and torch.device(m.device) != device
+                and torch.device(m.device).type != "cpu"
+                for m in module
+            ):
                 return None
             if not stages or stages[-1][0] != device:
                 if any(s[0] == device for s in stages):
@@ -232,6 +239,11 @@ class PrefillPipeline:
 
         def first():
             try:
+                # Wake the CPU-expert workers for this pass: chunks arrive one per stage thread
+                # now, so prefill_ls() no longer runs to do it once per chunk
+                begin_pass = getattr(model, "begin_prefill_pass", None)
+                if begin_pass is not None:
+                    begin_pass()
                 run["x"] = model.prepare_inputs(input_ids, params)
                 for m in model._get_prefetch_layers:
                     m.prefetch(run["x"], params)

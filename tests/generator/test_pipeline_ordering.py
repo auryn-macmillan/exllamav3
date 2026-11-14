@@ -271,13 +271,15 @@ def test_plan_declines_one_device_or_a_revisit(devices):
     assert PrefillPipeline.plan(plan_model(devices), None) is None
 
 
-def test_plan_declines_tp_and_cpu_offload():
+def test_plan_declines_tp_but_allows_cpu_offload():
     m = plan_model(["cuda:0", "cuda:1"])
     m.loaded_tp = True
     assert PrefillPipeline.plan(m, None) is None
+    # CPU-expert hosts are host-side co-processors, not another device: their work stays on
+    # the stage's thread (see test_pipeline_cpu_moe.py)
     m = plan_model(["cuda:0", "cuda:1"])
     m.config.moe_cpu_hosts = {"host": object()}
-    assert PrefillPipeline.plan(m, None) is None
+    assert PrefillPipeline.plan(m, None) is not None
 
 
 def test_plan_declines_a_layer_with_a_part_on_another_device():

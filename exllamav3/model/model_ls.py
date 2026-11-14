@@ -503,13 +503,18 @@ class Model_LSMixin(ABC):
         return x
 
 
+    def begin_prefill_pass(self):
+        """Wake the CPU MoE workers for a pass; once per prefill chunk, before its first section"""
+        for h in getattr(self.config, "moe_cpu_hosts", {}).values():
+            h.begin_pass()
+
+
     def prefill_ls(
         self,
         x: torch.Tensor,
         params: dict,
     ):
-        for h in getattr(self.config, "moe_cpu_hosts", {}).values():
-            h.begin_pass()
+        self.begin_prefill_pass()
         self.run_section(x, params, 0, self.last_kv_end, True)
         del params["prefill"]
         return None
@@ -520,8 +525,7 @@ class Model_LSMixin(ABC):
         x: torch.Tensor,
         params: dict,
     ):
-        for h in getattr(self.config, "moe_cpu_hosts", {}).values():
-            h.begin_pass()
+        self.begin_prefill_pass()
         x = self.run_section(x, params, 0, len(self.fwd_modules), False)
         params.pop("resid_defer", None)
         pending = params.pop("resid_pending", None)

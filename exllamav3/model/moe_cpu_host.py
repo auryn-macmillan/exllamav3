@@ -1,5 +1,7 @@
 from __future__ import annotations
+import functools
 import os
+import threading
 import time
 import multiprocessing
 from multiprocessing import shared_memory
@@ -968,6 +970,17 @@ def _pinning_exhausted(e: Exception) -> bool:
     return "out of memory" in str(e).lower()
 
 
+def _serialized(method):
+    """Serialize the job- and staging-ring bookkeeping. One host serves every offloaded layer,
+    so with pipelined prefill the stage threads of different devices submit to the same ring;
+    the worker itself is asynchronous and still runs the jobs concurrently"""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class MoeCpuHost:
 
     @classmethod
@@ -987,6 +1000,7 @@ class MoeCpuHost:
 
     def __init__(self, config):
         self.config = config
+        self.lock = threading.RLock()
         self.model_dir = config.directory
         self.specs = []
         self.by_key = {}
@@ -1411,6 +1425,7 @@ class MoeCpuHost:
             raise RuntimeError("CPU MoE worker timed out (abort flag set)")
         self.v_pass_wake[0] += 1
 
+    @_serialized
     def submit(self, layer_idx, y, selected_experts, routing_weights):
         """
         Enqueue the routed-expert computation for one offloaded layer onto the current CUDA
@@ -1447,6 +1462,7 @@ class MoeCpuHost:
                 self._collect_compute(jobs, out, rtmp, h)
         return out
 
+    @_serialized
     def submit_issue(self, layer_idx, y, selected_experts, routing_weights):
         """
         Two-phase submit for the per-layer expert split: stage this layer's inputs and publish
@@ -1461,6 +1477,7 @@ class MoeCpuHost:
             jobs, rtmp = self._issue_compute(layer_idx, y, selected_experts, routing_weights, spec, out, h)
         return (jobs, rtmp, out, h, y.device)
 
+    @_serialized
     def submit_collect(self, handle):
         """Enqueue the deferred flag waits and readbacks; returns the (asynchronously
         filled) output tensor. Never synchronizes the host."""
@@ -1469,6 +1486,7 @@ class MoeCpuHost:
             self._collect_compute(jobs, out, rtmp, h)
         return out
 
+    @_serialized
     def submit_issue_fused(self, layer_idx, y, selected_experts, routing_weights,
                            split_map, split_hist, first_cpu):
         """
@@ -1517,6 +1535,7 @@ class MoeCpuHost:
         self.slot_last_seq[slot_idx] = seq
         return (seq, slot_idx, rows, h_, spec["ho"], dev, counts)
 
+    @_serialized
     def submit_collect_fused(self, handle, final_2d):
         """Fold the worker's partial into final_2d (rows, h) in place, straight from the
         pinned slot, or, for a job the issue kernel recorded as empty, do nothing (no
@@ -1923,6 +1942,7 @@ class MoeCpuHost:
         if msg[0] != "ok":
             raise RuntimeError(f"CPU MoE worker expert install failed: {msg[1] if len(msg) > 1 else msg}")
 
+    @_serialized
     def submit_prefill(self, layer_idx, y, selected_experts, routing_weights):
         """
         Split the routed-expert workload by per-expert token count: hot experts (count >=
