@@ -27,6 +27,12 @@ served, on one thread. That gives the two properties everything depends on:
 - An item can't overtake one issued before it: at the first device it runs later, so it reaches the next device later,
   and so on. A checkpoint therefore reads the states of every layer exactly as the chunks before it left them.
 
+A device the modules are pinned to (caps["attn_device"]) has no stage of its own: the stage that owns a pinned part
+drives it inline, from its own thread. Its work is the exception to the first point, so the pipeline keeps one lock
+per pinned device (device_locks, installed on the config) and the hop takes it. An item still can't overtake one
+issued before it: the pinned device's own queue is ordered by the lock and the stream, and the stage threads that
+reach it do so in route order.
+
 Only prefill goes through here. Model.forward and everything else that uses the devices, or reads what the items
 write, waits for the route to clear first (flush) and then has them to itself.
 """
@@ -50,6 +56,37 @@ class _Item:
         self.started = None
 
 
+def _children(module) -> list:
+    """The direct children of a module, or, for a module that only enumerates itself (a test double), those"""
+    modules = getattr(module, "modules", None)
+    if modules is not None:
+        return [m for m in modules if m is not None]
+    try:
+        return [m for m in module if m is not module]
+    except TypeError:
+        return []
+
+
+def _foreign_device_parts_ok(module, device, pinned: set) -> bool:
+    """
+    Whether every part of module on another CUDA device is a module pinned there (caps["attn_device"],
+    Model.load attn_device), collecting the pinned devices in pinned. Any other part left on a foreign
+    device would run on the wrong device's thread, with nothing ordering it against the stages that own
+    that device. A pinned part is serialized instead (see PrefillPipeline.device_locks), so the stage
+    thread can drive it where it stands.
+    """
+    for m in _children(module):
+        md = torch.device(m.device) if m.device is not None else None
+        if md is not None and md != device and md.type == "cuda":
+            if not getattr(m, "caps", {}).get("attn_device"):
+                return False
+            pinned.add(md)
+            continue
+        if not _foreign_device_parts_ok(m, device, pinned):
+            return False
+    return True
+
+
 class PrefillPipeline:
 
     @classmethod
@@ -63,20 +100,21 @@ class PrefillPipeline:
         if not modules or model.loaded_tp:
             return None
         stages = []
+        pinned_at = {}
+        pinned_all = set()
         for i, (module, _, _) in enumerate(modules):
             device = torch.device(module.device)
             if device.type != "cuda":
                 continue
-            # Parts of a layer on another CUDA device would run on the wrong device's thread.
-            # Host-side parts (pinned linears, CPU-expert hosts) stay on this stage's thread:
-            # MoeCpuHost serializes its job ring and staging ring across the stage threads
-            if any(
-                m.device is not None
-                and torch.device(m.device) != device
-                and torch.device(m.device).type != "cpu"
-                for m in module
-            ):
+            # Host-side parts (pinned linears, CPU-expert hosts) stay on this stage's thread: MoeCpuHost
+            # serializes its job ring and staging ring across the stage threads. Attention pinned to the
+            # split's attention device is serialized per device by this pipeline instead, and keeps its
+            # place in the route because the first stage has to run it before the recurrent states advance
+            pinned = set()
+            if not _foreign_device_parts_ok(module, device, pinned):
                 return None
+            pinned_at[i] = pinned
+            pinned_all |= pinned
             if not stages or stages[-1][0] != device:
                 if any(s[0] == device for s in stages):
                     return None
@@ -87,13 +125,20 @@ class PrefillPipeline:
         stages = [(s[0], s[1], e) for s, e in zip(stages, ends)]
         devices = [s[0] for s in stages]
 
+        # A pinned device is driven inline by the modules that own it, so the route does not list it; the
+        # modules of the first stage are what the states have to be advanced by before section 1 runs
+        first = set(devices[:1])
+        for i in range(stages[0][2]):
+            first |= pinned_at.get(i, set())
+
         if cache is not None and cache.recurrent_state_cls is not None:
             layers = {torch.device(l.device) for l in cache.get_all_recurrent_layers().values()}
-            if not layers <= set(devices):
+            if not layers <= (set(devices) | pinned_all):
                 return None
             # Ring states decide their shift in the forward: the first section has to, so that the state can
-            # advance for the next chunk before the section after it has run
-            if getattr(cache.recurrent_state_cls, "guaranteed_rollback", 0) and devices[0] not in layers:
+            # advance for the next chunk before the section after it has run. A pinned device the first
+            # section drives inline counts, as its layers' attention runs there
+            if getattr(cache.recurrent_state_cls, "guaranteed_rollback", 0) and not (layers & first):
                 return None
 
         draft_stage = None
@@ -110,13 +155,42 @@ class PrefillPipeline:
         return stages, draft_stage
 
 
-    def __init__(self, model, stages: list, draft_stage: int | None, on_idle = None):
+    @staticmethod
+    def _pinned_devices(model) -> set:
+        """The devices the model's modules are pinned to (caps["attn_device"]), if any"""
+        pinned = set()
+        for entry in getattr(model, "fwd_modules", None) or []:
+            if not isinstance(entry, tuple):
+                continue
+            device = torch.device(entry[0].device)
+            if device.type == "cuda":
+                _foreign_device_parts_ok(entry[0], device, pinned)
+        return pinned
+
+
+    def __init__(self, model, stages: list, draft_stage: int | None, on_idle = None,
+                 draft_model = None):
         self.model = model
         self.stages = stages
         self.route = [s[0] for s in stages]
         self.draft_stage = draft_stage
         self.on_idle = on_idle
         self.local = threading.local()
+
+        # One lock per device that modules are pinned to (attn_device): every stage thread may drive it
+        # (a layer's attention hop runs from whichever device the layer lives on), so the lock keeps the
+        # hop and the forward of one chunk from interleaving with another's
+        self.device_locks = {}
+        for m in (model, draft_model):
+            if m is None:
+                continue
+            for device in self._pinned_devices(m):
+                self.device_locks.setdefault(device, threading.Lock())
+        for m in (model, draft_model):
+            config = getattr(m, "config", None) if m is not None else None
+            if config is not None:
+                config.device_locks = self.device_locks
+
         self.cond = threading.Condition()
         self.in_flight = 0
         self.passes = 0

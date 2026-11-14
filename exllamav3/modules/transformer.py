@@ -141,6 +141,21 @@ class TransformerBlock(Module):
             hc_flush(params)
         return super().prepare_for_device(x, params)
 
+    def _pinned_attention(self, y: torch.Tensor, params: dict) -> torch.Tensor:
+        # Attention pinned to the split's attention device (Model.load attn_device): its fp16 input and
+        # output are what crosses, the residual streams stay here. Every stage thread may drive the pinned
+        # device, so the pipeline installs a lock for each such device on the config and the hop takes it,
+        # which keeps one chunk's attention (and the host-side bookkeeping of its pools and rings) from
+        # interleaving with another's
+        locks = getattr(self.config, "device_locks", None)
+        lock = locks.get(self.attn.device) if locks else None
+        if lock is None:
+            y = self.attn.forward(self.attn.prepare_for_device(y, params), params)
+            return to_device(y, self.device)
+        with lock:
+            y = self.attn.forward(self.attn.prepare_for_device(y, params), params)
+            return to_device(y, self.device)
+
     @override
     def forward(
         self,
@@ -180,10 +195,7 @@ class TransformerBlock(Module):
             else:
                 y = x.half()
             if self.attn.device != self.device:
-                # Attention pinned to the split's attention device (Model.load attn_device): its fp16
-                # input and output are what crosses, the residual streams stay here
-                y = self.attn.forward(self.attn.prepare_for_device(y, params), params)
-                y = to_device(y, self.device)
+                y = self._pinned_attention(y, params)
             else:
                 y = self.attn.forward(y, params)
             if params.get("prefill") and not export_state:

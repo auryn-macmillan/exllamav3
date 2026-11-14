@@ -241,8 +241,9 @@ class Generator:
 
         :param pipelined_prefill:
             With the model split across devices, let them work on different prefill chunks at once, each device
-            on its own thread (see PrefillPipeline). Ignored where a split can't: tensor parallel, CPU expert
-            offload, attention pinned to one device, a draft model on several devices or reading the target's cache
+            on its own thread (see PrefillPipeline). Ignored where a split can't: tensor parallel, a layer with
+            parts on a device other than its own that the architecture doesn't pin there (attn_device is
+            serialized by the pipeline and allowed), a draft model on several devices or reading the target's cache
 
         :param kwargs:
         """
@@ -445,7 +446,8 @@ class Generator:
         plan = PrefillPipeline.plan(self.model, cache, draft_model) if pipelined_prefill else None
         if plan is not None:
             on_idle = self.recurrent_cache.write_settled if self.recurrent_cache is not None else None
-            self.pipeline = PrefillPipeline(self.model, *plan, on_idle = on_idle)
+            self.pipeline = PrefillPipeline(self.model, *plan, on_idle = on_idle,
+                                            draft_model = draft_model)
         self.model.pipeline = self.pipeline
         if draft_model is not None:
             draft_model.pipeline = self.pipeline
